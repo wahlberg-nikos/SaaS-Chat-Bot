@@ -15,10 +15,10 @@ class SupportAssistant:
         try:
             self.client = AzureOpenAI(
                 api_key=os.getenv("AZURE_API_KEY"),
-                api_version=os.getenv("AZURE_API_VERSION", "2024-12-01-preview"), # Updated to match your .env
+                api_version=os.getenv("AZURE_API_VERSION", "2024-12-01-preview"),
                 azure_endpoint=os.getenv("AZURE_ENDPOINT")
             )
-            self.deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-5.2-chat") # Updated to match your .env
+            self.deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-5.2-chat")
         except Exception as e:
             st.error(f"Error initializing Azure OpenAI client: {e}")
             st.stop()
@@ -46,7 +46,7 @@ class SupportAssistant:
         self.conversation_history = []
         self.max_history_window = 6
         self.temperature = 1 
-        self.max_completion_tokens = 250 
+        self.max_completion_tokens = 2500 # Increased for better reasoning responses
 
     def get_response(self, user_input):
         suspicious_keywords = [
@@ -54,7 +54,9 @@ class SupportAssistant:
             "routing number", "cvv", "debit card", "passport number", 
             "driver's license", "drivers license", "private key", "bearer token"
         ]
+        
         if any(keyword in user_input.lower() for keyword in suspicious_keywords):
+            # Return a simple string; the UI loop will handle strings vs streams
             return "I cannot process messages containing highly sensitive personal data. Please remove this information."
 
         self.conversation_history.append({"role": "user", "content": user_input})
@@ -62,15 +64,14 @@ class SupportAssistant:
         messages_payload = [self.system_prompt] + trimmed_history
 
         try:
-            response = self.client.chat.completions.create(
+            # Note: We return the stream object itself
+            return self.client.chat.completions.create(
                 model=self.deployment_name,
                 messages=messages_payload,
                 temperature=self.temperature,
-                max_completion_tokens=self.max_completion_tokens
+                max_completion_tokens=self.max_completion_tokens,
+                stream=True  # ENABLE STREAMING
             )
-            assistant_message = response.choices[0].message.content
-            self.conversation_history.append({"role": "assistant", "content": assistant_message})
-            return assistant_message
         except Exception as e:
             return f"System Error: Connection failed. ({e})"
 
@@ -79,43 +80,71 @@ class SupportAssistant:
 
 st.title("☁️ CloudScale SaaS Support")
 
-# 1. Ask for the user's name if we don't have it yet
+# 1. Session Initialization (Ask for name)
 if "customer_name" not in st.session_state:
     with st.form("name_form"):
         name_input = st.text_input("Please enter your name to begin:")
         submitted = st.form_submit_button("Start Chat")
         if submitted:
-            st.session_state.customer_name = name_input.strip() or "Valued Customer"
-            st.rerun() # Refresh the page to load the chat
-    st.stop() # Stop rendering the rest of the page until they enter a name
+            # Handle 'exit' or 'restart' edge cases at name prompt
+            if name_input.lower().strip() == "exit":
+                st.info("Goodbye! Have a great day.")
+                st.stop()
+            elif name_input.lower().strip() in ["restart", "clear"]:
+                st.warning("We haven't started yet! Please enter your name.")
+            else:
+                st.session_state.customer_name = name_input.strip() or "Valued Customer"
+                st.rerun()
+    st.stop()
 
-# 2. Initialize the Assistant in session_state so it remembers the history
+# 2. Initialize the Assistant
 if "assistant" not in st.session_state:
     st.session_state.assistant = SupportAssistant(customer_name=st.session_state.customer_name)
     initial_greeting = f"Hello {st.session_state.customer_name}! Welcome to CloudScale Support. I see you are on the Pro plan. How can I help you today?"
     st.session_state.assistant.conversation_history.append({"role": "assistant", "content": initial_greeting})
 
-# 3. Sidebar with a reset button
+# 3. Sidebar
 with st.sidebar:
     st.markdown("### Support Controls")
     if st.button("Restart Chat"):
-        del st.session_state.assistant # Delete the memory
-        st.rerun() # Refresh the page
+        del st.session_state.assistant
+        del st.session_state.customer_name
+        st.rerun()
 
-# 4. Draw the existing chat history to the screen
+# 4. Display Chat History
 for msg in st.session_state.assistant.conversation_history:
-    # Streamlit uses "user" and "assistant" roles natively!
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# 5. Handle new user input
+# 5. Handle Chat Input
 if prompt := st.chat_input("Type your message here..."):
-    # Draw the user's message immediately
+    # Display user message
     with st.chat_message("user"):
         st.markdown(prompt)
         
-    # Show a spinner while the AI thinks, then draw the AI's response
+    # Handle response with streaming effect
     with st.chat_message("assistant"):
-        with st.spinner("Agent is typing..."):
-            response = st.session_state.assistant.get_response(prompt)
-            st.markdown(response)
+        response_placeholder = st.empty()
+        full_response = ""
+        
+        result = st.session_state.assistant.get_response(prompt)
+        
+        # Check if result is a stream or an error/guardrail string
+        if isinstance(result, str):
+            full_response = result
+            response_placeholder.markdown(full_response)
+        else:
+            # Iterate through the stream chunks
+            for chunk in result:
+                if len(chunk.choices) > 0:
+                    content = chunk.choices[0].delta.content
+                    if content is not None:
+                        full_response += content
+                        # Add a blinking cursor effect
+                        response_placeholder.markdown(full_response + "▌")
+            
+            # Remove cursor and show final response
+            response_placeholder.markdown(full_response)
+            
+        # Save the final response to conversation history
+        st.session_state.assistant.conversation_history.append({"role": "assistant", "content": full_response})
